@@ -63,10 +63,40 @@ def test_door_state_and_train_state(tmp_path):
     assert state == {
         "train_id": "T01",
         "aligned": True,
-        "alignment_m": 5,
+        "alignment_suspended": False,
+        "alignment_m": 5.0,
+        "alignment_attempt": 1,
+        "segment_count": 1,
+        "confirmed_segments": 1,
+        "rejected_segments": [],
+        "segments": state["segments"],
         "doors_open": True,
         "position_m": 6,
     }
+
+
+def test_segmented_alignment_recovers_orphan_rejected_segment(tmp_path):
+    store = JsonStore(str(tmp_path))
+    registry = AlignRegistry(store, tolerance_m=0.8)
+    registry.start_session("T01", "ST1", {"S1": 0.0, "S2": 6.0}, at=1.0)
+    store.remove("train/T01/align/attempt/0001")
+    store.write(
+        "train/T01/align/attempt/0001/segment/0000",
+        {
+            "train_id": "T01",
+            "attempt": 1,
+            "index": 0,
+            "segment_id": "S1",
+            "target_m": 0.0,
+            "position_m": 0.0,
+            "offset_m": 0.0,
+            "status": "rejected",
+            "at": 2.0,
+        },
+    )
+    recovered = AlignRegistry(store, tolerance_m=0.8).session_view("T01")
+    assert recovered["state"] == "suspended"
+    assert recovered["rejected_segments"] == ["S1"]
 
 
 def test_position_tracker_rejects_out_of_range(tmp_path):

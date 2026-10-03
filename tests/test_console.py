@@ -84,6 +84,36 @@ def test_api_action_flow(platform):
     assert status == 200 and departure["ok"] is True
 
 
+def test_api_segmented_alignment_resume_flow(platform):
+    api = Api(platform)
+    segments = [
+        {"segment_id": "S1", "position_m": 0},
+        {"segment_id": "S2", "position_m": 7},
+    ]
+    status, first = api.handle(
+        "POST", "/api/arrive", {}, {"train_id": "T02", "station_id": "ST1", "segments": segments}
+    )
+    assert status == 200 and first["ok"] is False
+    fixed = [
+        {"segment_id": "S1", "position_m": 0},
+        {"segment_id": "S2", "position_m": 6},
+    ]
+    status, resumed = api.handle(
+        "POST",
+        "/api/align-segments",
+        {},
+        {"train_id": "T02", "station_id": "ST1", "resume": True, "segments": fixed},
+    )
+    assert status == 200 and resumed["all_confirmed"] is True
+    status, opened = api.handle(
+        "POST",
+        "/api/arrive",
+        {},
+        {"train_id": "T02", "station_id": "ST1", "segments": fixed},
+    )
+    assert status == 200 and opened["ok"] is True
+
+
 def test_api_rejects_missing_and_bad_fields(platform):
     api = Api(platform)
     status, payload = api.handle("POST", "/api/arrive", {}, {"station_id": "ST1"})

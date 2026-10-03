@@ -75,6 +75,7 @@ class Api:
         add("GET", "/api/resolve", self._resolve)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/arrive", self._arrive)
+        add("POST", "/api/align-segments", self._align_segments)
         add("POST", "/api/depart", self._depart)
         add("POST", "/api/gap", self._gap)
         add("POST", "/api/enqueue", self._enqueue)
@@ -188,10 +189,27 @@ class Api:
     # ---- 动作 ---------------------------------------------------------
 
     def _arrive(self, params: dict, body: dict) -> dict:
+        position = body.get("position_m")
+        if position is None and "segments" not in body:
+            raise RailError("缺少 position_m 或 segments", component="console")
         return self._platform.arrive(
             _require(body, "train_id"),
             _require(body, "station_id"),
-            _as_int(body, "position_m", 0),
+            None if position is None else _as_float(body, "position_m", 0.0),
+            body.get("segments"),
+            str(body.get("request_id", "")),
+        )
+
+    def _align_segments(self, params: dict, body: dict) -> dict:
+        segments = body.get("segments", body)
+        if not isinstance(segments, (list, dict)):
+            raise RailError("segments 必须是数组或对象", component="console")
+        return self._platform.align_segments(
+            _require(body, "train_id"),
+            _require(body, "station_id"),
+            segments,
+            resume=bool(body.get("resume", False)),
+            request_id=str(body.get("request_id", "")),
         )
 
     def _depart(self, params: dict, body: dict) -> dict:

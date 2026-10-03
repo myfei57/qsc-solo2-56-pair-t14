@@ -39,6 +39,7 @@ class StationSection:
     doors_per_group: int = 6
     group_span_m: float = 24.0
     stop_tolerance_m: float = 0.8
+    alignment_max_segments: int = 16
 
 
 @dataclass(frozen=True)
@@ -151,6 +152,8 @@ class PlatformConfig:
             raise ConfigError("每门区门数必须为正", component="config")
         if self.station.stop_tolerance_m <= 0:
             raise ConfigError("对位公差必须为正", component="config")
+        if not 1 <= self.station.alignment_max_segments <= 64:
+            raise ConfigError("对位分段数必须落在 1..64", component="config")
         if self.train.max_position_m <= 0:
             raise ConfigError("列车位置上限必须为正", component="config")
         if self.train.dwell_max_s <= 0:

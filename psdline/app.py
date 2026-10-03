@@ -4,11 +4,14 @@
 探测、配额与审计按真实调用链装到一起，并暴露四件事：到发编排（到站、发车、
 门区联动、批量开门、清扫）、控制循环、状态快照与手动检修动作。
 
-控制链固定为「信号 → 停稳对位 → 开门 → 间隙探测 → 关门 → 发车 → 审计」，
-任何一步错位都会被对应组件拒绝，并把拒绝原因落进审计。
+控制链固定为「信号 → 分段停稳对位 → 全段落盘 → 开门 → 间隙探测 → 关门 → 发车 →
+审计」，任何一步错位都会被对应组件拒绝，并把拒绝原因落进审计。
 """
 
 from __future__ import annotations
+
+import json
+import math
 
 from .audit import AuditLog, build_timeline
 from .clock import Clock, SystemClock
@@ -26,6 +29,7 @@ from .door import (
     open_pressure,
     open_doors,
     open_group,
+    opened,
     process_queue,
     queued_total,
 )
@@ -61,6 +65,7 @@ from .station import (
 from .store import CommandLog, JsonStore, JsonlJournal, StoreMetrics
 from .telemetry import TrendBuffer
 from .train import (
+    DEPARTED,
     AlignRegistry,
     DoorStateRegistry,
     Dwell,
@@ -68,6 +73,8 @@ from .train import (
     PositionTracker,
     Route,
     RouteRegistry,
+    SegmentMeasurement,
+    SUSPENDED,
     Train,
     TrainRegistry,
     train_state,
@@ -110,7 +117,12 @@ class Platform:
         self.layouts = LayoutRegistry(store)
         self.schedules = ScheduleRegistry(store)
         self.trains = TrainRegistry(store)
-        self.align = AlignRegistry(store, tolerance_m=self.config.station.stop_tolerance_m)
+        self.align = AlignRegistry(
+            store,
+            tolerance_m=self.config.station.stop_tolerance_m,
+            max_segments=self.config.station.alignment_max_segments,
+            stale_after_s=self.config.signal.stale_after_s,
+        )
         self.train_doors = DoorStateRegistry(store)
         self.dwells = DwellRegistry(store, max_seconds=self.config.train.dwell_max_s)
         self.positions = PositionTracker(
@@ -346,34 +358,53 @@ class Platform:
 
     # ---- 到发编排 -----------------------------------------------------
 
-    def arrive(self, train_id: str, station_id: str, position_m: int) -> dict:
-        """到站到开门：信号到站 → 停稳对位 → 对位落盘 → 开门。"""
+    def arrive(
+        self,
+        train_id: str,
+        station_id: str,
+        position_m: int | None = None,
+        segments: list | dict | None = None,
+        request_id: str = "",
+    ) -> dict:
+        """到站到开门：信号到站 → 分段对位逐段落盘 → 全段确认后开门。
+
+        ``position_m`` 是旧上位机的单位置报文，按一个分段处理；新上位机可传
+        ``segments``。同一列车同一站台的重复到站请求会复用未结束会话；显式
+        ``request_id`` 的响应按标识幂等返回。
+        """
 
         op_id = self.ids.labeled("arrive")
         steps: list[dict] = []
         violations: list[str] = []
 
-        def reject(reason: str) -> dict:
-            violations.append(reason)
-            self.bus.publish(
-                Event.of(
-                    "audit",
-                    "interlock",
-                    "arrive_rejected",
-                    op_id=op_id,
-                    train_id=train_id,
-                    station_id=station_id,
-                    severity="alarm",
-                    message=reason,
-                )
+        try:
+            targets, measurements, legacy_scalar = self._parse_alignment_input(
+                station_id, position_m, segments
             )
-            return {
-                "ok": False,
-                "train_id": train_id,
-                "station_id": station_id,
-                "steps": steps,
-                "violations": violations,
-            }
+        except RailError as error:
+            return self._arrive_rejected(
+                op_id, train_id, station_id, error.message, steps, violations, request_id
+            )
+
+        request_fingerprint = self._request_fingerprint(position_m, targets, measurements)
+        cached = self.align.load_idempotent(train_id, station_id, request_id)
+        if cached is not None:
+            if cached.get("request_fingerprint") != request_fingerprint:
+                return self._arrive_rejected(
+                    op_id,
+                    train_id,
+                    station_id,
+                    "同一 request_id 的请求内容不一致",
+                    steps,
+                    violations,
+                    request_id,
+                )
+            return {**cached, "op_id": op_id, "replayed": True}
+
+        def reject(reason: str) -> dict:
+            return self._arrive_rejected(
+                op_id, train_id, station_id, reason, steps, violations, request_id
+            )
 
         if not self.quotas.consume(ARRIVAL):
             return reject("到站配额已用完")
@@ -384,6 +415,35 @@ class Platform:
         if self.stations.get(station_id) is None:
             return reject(f"站台未登记: {station_id}")
 
+        active = self.align.active_session(train_id)
+        if (
+            active is not None
+            and active.get("state") == SUSPENDED
+            and legacy_scalar
+            and active.get("segment_count") == 1
+        ):
+            resumed = self.align.resume_session(train_id, station_id, self.clock.now())
+            self.audit.record(
+                "alignment_resumed",
+                train_id,
+                station_id,
+                attempt=resumed["attempt"],
+                carried_segments=resumed["carried_prefix"],
+                legacy=True,
+            )
+            active = self.align.active_session(train_id)
+        fresh = active is None or active.get("state") == DEPARTED or bool(active.get("legacy"))
+        if active is not None and active.get("state") == SUSPENDED:
+            return reject("对位已挂起，请调用分段重新对位接口从未确认段续作")
+        if (
+            active is not None
+            and not fresh
+            and str(active.get("station_id", "")) != station_id
+        ):
+            return reject(f"列车仍在 {active.get('station_id')} 站对位，不能切换站台")
+
+        if fresh:
+            self._clear_arrival_products(train_id)
         self.signals.raise_signal(train_id, ARRIVAL, self.clock.now())
         steps.append(
             {"component": "sig", "action": "arrival_signal", "detail": {"train_id": train_id}}
@@ -392,44 +452,181 @@ class Platform:
             self.trains.upsert(Train(id=train_id, line=self.namespace.line_id()))
         self.trains.assign_station(train_id, station_id)
 
-        stop_position = self._stop_position(station_id)
         try:
-            alignment = self.align.align(train_id, position_m, stop_position, self.clock.now())
+            if fresh:
+                session = self.align.start_session(
+                    train_id,
+                    station_id,
+                    targets,
+                    self.clock.now(),
+                    layout_revision=self.mappings.revision(station_id),
+                    request_id=request_id,
+                )
+                self.audit.record(
+                    "alignment_started",
+                    train_id,
+                    station_id,
+                    attempt=session["attempt"],
+                    segment_count=session["segment_count"],
+                    legacy=legacy_scalar,
+                )
+            elif active.get("state") == SUSPENDED:
+                session = self.align.session_view(train_id)
+            else:
+                session = self.align.session_view(train_id)
+            session = self._report_alignment(
+                train_id, station_id, measurements, request_id, steps, legacy_scalar
+            )
         except RailError as error:
             return reject(error.message)
-        steps.append(
-            {
-                "component": "train",
-                "action": "align",
-                "detail": {"train_id": train_id, "position_m": alignment.position_m},
-            }
+
+        if not session["durable"]:
+            return reject(
+                f"仅有 {session['confirmed_count']}/{session['segment_count']} 个分段落盘，禁止开门"
+            )
+        try:
+            door_report = self.doors_open(train_id, station_id)
+        except RailError as error:
+            return reject(error.message)
+        entry = self.audit.record(
+            ARRIVAL,
+            train_id,
+            station_id,
+            position_m=measurements[-1].position_m if measurements else 0,
+            segment_count=session["segment_count"],
+            attempt=session["attempt"],
         )
-        try:
-            self.doors_open(train_id, station_id)
-        except RailError as error:
-            return reject(error.message)
-        entry = self.audit.record(ARRIVAL, train_id, station_id, position_m=position_m)
         report = {
             "ok": True,
             "train_id": train_id,
             "station_id": station_id,
-            "position_m": alignment.position_m,
+            "position_m": session["segments"][-1]["position_m"] if session["segments"] else 0,
+            "alignment": session,
+            "segment_count": session["segment_count"],
+            "confirmed_segments": session["confirmed_count"],
+            "attempt": session["attempt"],
+            "reused": not fresh,
+            "group": door_report.get("group", ""),
             "steps": steps,
             "violations": [],
         }
         summary = self._record_operation(op_id, "arrive", report)
+        result = {**report, **summary, "arrival_audit": entry.id, "request_fingerprint": request_fingerprint}
         self._operations += 1
         self._persist()
-        return {**report, **summary, "arrival_audit": entry.id}
+        self.align.save_idempotent(train_id, station_id, request_id, result, self.clock.now())
+        return result
+
+    def align_segments(
+        self,
+        train_id: str,
+        station_id: str,
+        segments: list | dict,
+        *,
+        resume: bool = False,
+        request_id: str = "",
+    ) -> dict:
+        """分段上报对位；``resume=True`` 时从挂起 attempt 的已确认前缀续作。"""
+
+        op_id = self.ids.labeled("align")
+        active = self.align.active_session(train_id)
+        if active is None:
+            raise RailError(f"列车 {train_id} 没有对位会话", component="train")
+        if str(active.get("station_id", "")) != station_id:
+            raise RailError("分段上报的站台与当前会话不一致", component="train")
+        if active.get("state") == SUSPENDED and not resume:
+            raise RailError("对位已挂起，必须带 resume=true 重新对位", component="train")
+        if resume and active.get("state") == SUSPENDED:
+            session = self.align.resume_session(
+                train_id, station_id, self.clock.now(), request_id=request_id
+            )
+            self.audit.record(
+                "alignment_resumed",
+                train_id,
+                station_id,
+                attempt=session["attempt"],
+                carried_segments=session["carried_prefix"],
+            )
+        active_targets = dict(active.get("targets", {}))
+        known_segments = list(active_targets.keys())
+        targets, measurements, _legacy = self._parse_alignment_input(
+            station_id,
+            None,
+            segments,
+            fallback_targets=active_targets,
+        )
+        if resume:
+            expected = known_segments
+            provided = list(targets.keys())
+            unknown = [key for key in provided if key not in active_targets]
+            if unknown or provided != expected:
+                raise RailError(
+                    "续作必须从下一个未确认段开始，并重新核对全部后续分段",
+                    component="train",
+                )
+            if any(targets[key] != active_targets[key] for key in targets):
+                raise RailError("续作分段的目标位置与挂起会话不一致", component="train")
+        elif list(targets.keys()) != list(active_targets.keys()):
+            raise RailError("分段集合与当前对位会话不一致", component="train")
+        request_fingerprint = self._request_fingerprint(None, targets, measurements)
+        cached = self.align.load_idempotent(train_id, station_id, request_id)
+        if cached is not None:
+            if cached.get("request_fingerprint") != request_fingerprint:
+                raise RailError("同一 request_id 的请求内容不一致", component="console")
+            return {**cached, "op_id": op_id, "replayed": True}
+        if not measurements:
+            raise RailError("对位分段不能为空", component="console")
+        steps: list[dict] = []
+        session = self._report_alignment(
+            train_id, station_id, measurements, request_id, steps, False
+        )
+        result = {
+            "ok": True,
+            "train_id": train_id,
+            "station_id": station_id,
+            "alignment": session,
+            "state": session["state"],
+            "suspended": session["suspended"],
+            "all_confirmed": session["durable"],
+            "confirmed_segments": session["confirmed_count"],
+            "segment_count": session["segment_count"],
+            "attempt": session["attempt"],
+            "steps": steps,
+            "violations": [],
+            "request_fingerprint": request_fingerprint,
+        }
+        self._record_operation(op_id, "align_segments", result)
+        self.align.save_idempotent(train_id, station_id, request_id, result, self.clock.now())
+        return result
 
     def doors_open(self, train_id: str, station_id: str) -> dict:
-        """开门并确认车门：对位必须先落盘。"""
+        """开门并确认车门：所有分段对位必须先落盘。"""
 
-        report = open_doors(self.doors, train_id, self.clock.now())
+        session = self.align.session_view(train_id)
+        if session is None or not session["durable"]:
+            raise RailError("全部分段落盘前不能开门", component="door")
         group = self._primary_group(station_id)
-        if group:
-            open_group(self.doors, self.mappings, station_id, group)
-        self.train_doors.confirm_open(train_id, self.clock.now())
+        already_open = opened(self.doors, train_id)
+        opened_gate_ids: list[str] = []
+        if not already_open and group:
+            opened_gate_ids = open_group(self.doors, self.mappings, station_id, group)["opened"]
+        try:
+            if already_open:
+                report = {
+                    "ok": True,
+                    "train_id": train_id,
+                    "position_m": session["segments"][-1]["position_m"] if session["segments"] else 0,
+                    "violations": [],
+                }
+            else:
+                report = open_doors(self.doors, train_id, self.clock.now())
+            self.align.mark_opened(train_id, self.clock.now())
+            self.train_doors.confirm_open(train_id, self.clock.now())
+        except RailError:
+            if not already_open:
+                for gate_id in opened_gate_ids:
+                    self.gates.set_open(gate_id, False)
+            raise
         self.bus.publish(
             Event.of(
                 "door",
@@ -505,6 +702,7 @@ class Platform:
             {"component": "sig", "action": "depart_signal", "detail": {"train_id": train_id}}
         )
         departure = depart(self.doors, train_id, self.clock.now())
+        self.align.mark_departed(train_id, self.clock.now())
         if gate is not None:
             self.lockouts.clear(gate.id)
         report = {
@@ -840,6 +1038,208 @@ class Platform:
         if not self.store.exists("platform/state"):
             return False
         return self.store.remove("platform/state")
+
+    def _arrive_rejected(
+        self,
+        op_id: str,
+        train_id: str,
+        station_id: str,
+        reason: str,
+        steps: list[dict],
+        violations: list[str],
+        request_id: str,
+        request_fingerprint: str = "",
+    ) -> dict:
+        """登记到站拒绝，并让相同 request_id 的重试拿到一致失败结果。"""
+
+        violations.append(reason)
+        self.bus.publish(
+            Event.of(
+                "audit",
+                "interlock",
+                "arrive_rejected",
+                op_id=op_id,
+                train_id=train_id,
+                station_id=station_id,
+                severity="alarm",
+                message=reason,
+            )
+        )
+        self.audit.record("alignment_rejected", train_id, station_id, reason=reason)
+        report = {
+            "ok": False,
+            "train_id": train_id,
+            "station_id": station_id,
+            "steps": steps,
+            "violations": list(violations),
+        }
+        result = {
+            **report,
+            **self._record_operation(op_id, "arrive", report),
+            "request_fingerprint": request_fingerprint,
+        }
+        self.align.save_idempotent(train_id, station_id, request_id, result, self.clock.now())
+        return result
+
+    @staticmethod
+    def _request_fingerprint(
+        position_m: float | None,
+        targets: dict[str, float],
+        measurements: list[SegmentMeasurement],
+    ) -> str:
+        """给幂等请求的业务输入定指纹；op_id、时间不参与。"""
+
+        payload = {
+            "position_m": None if position_m is None else float(position_m),
+            "targets": targets,
+            "segments": [
+                {"segment_id": item.segment_id, "position_m": item.position_m, "at": item.at}
+                for item in measurements
+            ],
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _parse_alignment_input(
+        self,
+        station_id: str,
+        position_m: int | float | None,
+        segments: list | dict | None,
+        fallback_targets: dict[str, float] | None = None,
+        zone_offset: int = 0,
+    ) -> tuple[dict[str, float], list[SegmentMeasurement], bool]:
+        """把旧单位置和新分段报文归一成目标位置与实测位置。"""
+
+        if segments is None:
+            if position_m is None:
+                raise RailError("缺少对位位置 position_m 或 segments", component="console")
+            target = float(self._stop_position(station_id))
+            return {"S1": target}, [SegmentMeasurement("S1", float(position_m))], True
+
+        layout = self.layouts.get(station_id)
+        zones = list(layout.zones) if layout else []
+        if isinstance(segments, dict):
+            raw_items = list(segments.get("segments", []))
+        else:
+            raw_items = list(segments)
+        if not raw_items:
+            raise RailError("对位分段不能为空", component="console")
+        if len(raw_items) > self.config.station.alignment_max_segments:
+            raise RailError(
+                f"对位分段数超过上限 {self.config.station.alignment_max_segments}",
+                component="console",
+            )
+        targets: dict[str, float] = {}
+        measurements: list[SegmentMeasurement] = []
+        seen: set[str] = set()
+        for index, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                raise RailError("每个对位分段必须是对象", component="console")
+            segment_id = str(item.get("segment_id") or item.get("id") or f"S{index + 1}")
+            if segment_id in seen:
+                raise RailError(f"对位分段 {segment_id} 重复", component="console")
+            seen.add(segment_id)
+            if "position_m" not in item:
+                raise RailError(f"分段 {segment_id} 缺少 position_m", component="console")
+            try:
+                measured = float(item["position_m"])
+            except (TypeError, ValueError) as error:
+                raise RailError(f"分段 {segment_id} 的 position_m 不是数值", component="console") from error
+            if not math.isfinite(measured):
+                raise RailError(f"分段 {segment_id} 的 position_m 必须有限", component="console")
+            zone_index = index + zone_offset
+            if item.get("target_m") is not None:
+                target = float(item["target_m"])
+            elif fallback_targets is not None and segment_id in fallback_targets:
+                target = float(fallback_targets[segment_id])
+            elif zone_index < len(zones):
+                target = float(zones[zone_index].distance_m)
+            else:
+                raise RailError(f"分段 {segment_id} 缺少目标位置 target_m", component="console")
+            if not math.isfinite(target):
+                raise RailError(f"分段 {segment_id} 的 target_m 必须有限", component="console")
+            targets[segment_id] = target
+            measurements.append(SegmentMeasurement(segment_id, measured))
+        if fallback_targets is not None and list(targets.keys()) != list(fallback_targets.keys()):
+            raise RailError("分段标识顺序必须与已创建会话一致", component="train")
+        return targets, measurements, False
+
+    def _report_alignment(
+        self,
+        train_id: str,
+        station_id: str,
+        measurements: list[SegmentMeasurement],
+        request_id: str,
+        steps: list[dict],
+        legacy_scalar: bool,
+    ) -> dict:
+        """上报分段并把逐段结果写入操作步骤；超差异常交调用方挂起编排。"""
+
+        if not measurements:
+            return self.align.session_view(train_id)
+        before_session = self.align.session_view(train_id)
+        before_count = before_session["confirmed_count"] if before_session else 0
+        before_attempt = before_session["attempt"] if before_session else 0
+        try:
+            session = self.align.report_segments(
+                train_id, measurements, self.clock.now(), request_id=request_id
+            )
+        except RailError:
+            failed = self.align.session_view(train_id)
+            self.audit.record(
+                "alignment_segment_rejected",
+                train_id,
+                station_id,
+                attempt=failed["attempt"] if failed else 0,
+                rejected_segments=",".join(failed["rejected_segments"]) if failed else "",
+            )
+            raise
+        new_segments = (
+            session["segments"][before_count:]
+            if before_attempt == session["attempt"]
+            else session["segments"]
+        )
+        for segment in new_segments:
+            self.audit.record(
+                "alignment_segment_confirmed",
+                train_id,
+                station_id,
+                attempt=session["attempt"],
+                segment_id=segment["segment_id"],
+                position_m=segment["position_m"],
+                target_m=segment["target_m"],
+                offset_m=segment["offset_m"],
+                carried=bool(segment.get("carried_from")),
+                legacy=legacy_scalar,
+            )
+            steps.append(
+                {
+                    "component": "train",
+                    "action": "align_segment",
+                    "detail": {
+                        "train_id": train_id,
+                        "segment_id": segment["segment_id"],
+                        "position_m": segment["position_m"],
+                        "offset_m": segment["offset_m"],
+                    },
+                }
+            )
+        if session["durable"]:
+            self.audit.record(
+                "alignment_completed",
+                train_id,
+                station_id,
+                attempt=session["attempt"],
+                segment_count=session["segment_count"],
+            )
+        return session
+
+    def _clear_arrival_products(self, train_id: str) -> None:
+        """新一轮到站前清门控/间隙派生态；历史审计与分段 attempt 不清。"""
+
+        for suffix in ("open", "close", "departed"):
+            self.store.remove(f"door/{train_id}/{suffix}")
+        self.store.remove(f"gap/{train_id}")
+        self.commands.clear(train_id)
 
     # ---- 内部 ---------------------------------------------------------
 

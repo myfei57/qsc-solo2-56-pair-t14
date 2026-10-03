@@ -56,8 +56,8 @@ class GapRegistry:
     def check(self, train_id: str, at: float) -> ProbeResult:
         """确认间隙无异常；未对位的列车直接拒绝。"""
 
-        if not self._store.exists(f"train/{train_id}/align"):
-            raise InterlockError(f"列车 {train_id} 尚未对位，无法确认间隙", component="gap")
+        if not self._alignment_durable(train_id):
+            raise InterlockError(f"列车 {train_id} 尚未完成分段对位，无法确认间隙", component="gap")
         self._store.write(
             self._doc_id(train_id),
             {"train_id": train_id, "state": CLEAR, "at": at},
@@ -89,6 +89,16 @@ class GapRegistry:
         if isinstance(raw, dict):
             return str(raw.get("state", ""))
         return ""
+
+    def _alignment_durable(self, train_id: str) -> bool:
+        """兼容 v1 单文档和 v2 分段会话：只有全段落盘才允许确认间隙。"""
+
+        raw = self._store.read(f"train/{train_id}/align")
+        if not isinstance(raw, dict):
+            return False
+        if int(raw.get("schema_version", 1)) < 2:
+            return bool(raw.get("durable", False))
+        return str(raw.get("state", "")) in ("completed", "opened")
 
     def blocked_ids(self) -> list[str]:
         """返回当前处于可疑状态的列车。"""

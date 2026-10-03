@@ -17,7 +17,7 @@ def test_start_reports_ready(platform):
 def test_arrive_then_depart_full_chain(platform):
     arrival = platform.arrive("T01", "ST1", 0)
     assert arrival["ok"] is True
-    assert [step["action"] for step in arrival["steps"]] == ["arrival_signal", "align"]
+    assert [step["action"] for step in arrival["steps"]] == ["arrival_signal", "align_segment"]
     assert platform.align.durable("T01") is True
     assert platform.train_doors.is_open("T01") is True
     gap = platform.check_gap("T01")
@@ -27,6 +27,65 @@ def test_arrive_then_depart_full_chain(platform):
     assert departure["close_durable"] is True
     assert departure["aspect"] == "green"
     assert departed(platform.doors, "T01") is True
+
+
+def test_segmented_alignment_requires_all_segments_and_resumes(platform):
+    bad = [
+        {"segment_id": "S1", "position_m": 0},
+        {"segment_id": "S2", "position_m": 7},
+        {"segment_id": "S3", "position_m": 12},
+        {"segment_id": "S4", "position_m": 18},
+    ]
+    first = platform.arrive("T01", "ST1", segments=bad)
+    assert first["ok"] is False
+    assert first["violations"]
+    assert platform.train_doors.is_open("T01") is False
+    session = platform.align.session_view("T01")
+    assert session["state"] == "suspended"
+    assert session["confirmed_count"] == 1
+    assert session["rejected_segments"] == ["S2"]
+
+    with pytest.raises(RailError):
+        platform.align_segments("T01", "ST1", bad[1:], resume=False)
+    good = [
+        {"segment_id": "S1", "position_m": 0},
+        {"segment_id": "S2", "position_m": 6},
+        {"segment_id": "S3", "position_m": 12},
+        {"segment_id": "S4", "position_m": 18},
+    ]
+    resumed = platform.align_segments("T01", "ST1", good, resume=True)
+    assert resumed["all_confirmed"] is True
+    assert resumed["attempt"] == 2
+    assert len(platform.align.history("T01")) == 2
+    assert platform.train_doors.is_open("T01") is False
+
+    opened = platform.arrive("T01", "ST1", segments=good)
+    assert opened["ok"] is True
+    assert platform.train_doors.is_open("T01") is True
+    again = platform.arrive("T01", "ST1", segments=good, request_id="same")
+    replay = platform.arrive("T01", "ST1", segments=good, request_id="same")
+    assert again["ok"] is True and replay.get("replayed") is True
+
+
+def test_segmented_alignment_revalidates_confirmed_prefix(platform):
+    first = platform.arrive(
+        "T01",
+        "ST1",
+        segments=[
+            {"segment_id": "S1", "position_m": 0},
+            {"segment_id": "S2", "position_m": 7},
+        ],
+    )
+    assert first["ok"] is False
+    moved = [
+        {"segment_id": "S1", "position_m": 2},
+        {"segment_id": "S2", "position_m": 6},
+    ]
+    with pytest.raises(RailError):
+        platform.align_segments("T01", "ST1", moved, resume=True)
+    view = platform.align.session_view("T01")
+    assert view["state"] == "suspended"
+    assert view["attempt"] == 2
 
 
 def test_arrive_rejects_out_of_tolerance_and_unknown_station(platform):

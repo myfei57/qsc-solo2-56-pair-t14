@@ -12,7 +12,8 @@
     "groups_per_station": 4,
     "doors_per_group": 6,
     "group_span_m": 24.0,
-    "stop_tolerance_m": 0.8
+    "stop_tolerance_m": 0.8,
+    "alignment_max_segments": 16
   },
   "train": {
     "length_m": 118.0,
