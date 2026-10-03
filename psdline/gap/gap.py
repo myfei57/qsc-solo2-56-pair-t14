@@ -53,10 +53,15 @@ class GapRegistry:
     def _doc_id(train_id: str) -> str:
         return f"gap/{train_id}"
 
-    def check(self, train_id: str, at: float) -> ProbeResult:
-        """确认间隙无异常；未对位的列车直接拒绝。"""
+    def check(self, train_id: str, at: float, aligned: bool | None = None) -> ProbeResult:
+        """确认间隙无异常；未对位的列车直接拒绝。
 
-        if not self._store.exists(f"train/{train_id}/align"):
+        ``aligned`` 由编排层（它持有分段对位注册表）传入；旧调用方不传时退化为
+        查旧单段落盘文档，保持旧链路可用。
+        """
+
+        is_aligned = self._store.exists(f"train/{train_id}/align") if aligned is None else aligned
+        if not is_aligned:
             raise InterlockError(f"列车 {train_id} 尚未对位，无法确认间隙", component="gap")
         self._store.write(
             self._doc_id(train_id),

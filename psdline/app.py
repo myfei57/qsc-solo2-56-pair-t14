@@ -29,7 +29,7 @@ from .door import (
     process_queue,
     queued_total,
 )
-from .errors import RailError
+from .errors import AlignmentError, RailError
 from .eventbus import Event, EventBus
 from .gap import GapRegistry, gap_summary
 from .ids import IdFactory
@@ -62,12 +62,15 @@ from .store import CommandLog, JsonStore, JsonlJournal, StoreMetrics
 from .telemetry import TrendBuffer
 from .train import (
     AlignRegistry,
+    CONFIRMED,
     DoorStateRegistry,
     Dwell,
     DwellRegistry,
+    HELD,
     PositionTracker,
     Route,
     RouteRegistry,
+    SEEKING,
     Train,
     TrainRegistry,
     train_state,
@@ -443,6 +446,271 @@ class Platform:
         )
         return {**report, "group": group}
 
+    # ---- 分段对位 -----------------------------------------------------
+
+    def begin_alignment(
+        self,
+        train_id: str,
+        station_id: str,
+        segment_count: int | None = None,
+        stop_id: str | None = None,
+    ) -> dict:
+        """到站并开始分段对位：信号到站 → 按段开会话（不直接开门）。"""
+
+        count = (
+            segment_count
+            if segment_count is not None
+            else self.config.train.alignment_segments
+        )
+        if count < 1:
+            return {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "violations": [f"对位分段数非法: {count}"],
+            }
+        if self.stations.get(station_id) is None or station_id not in self.namespace.station_ids():
+            return {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "violations": [f"站台未登记: {station_id}"],
+            }
+
+        self.signals.raise_signal(train_id, ARRIVAL, self.clock.now())
+        if self.trains.get(train_id) is None:
+            self.trains.upsert(Train(id=train_id, line=self.namespace.line_id()))
+        self.trains.assign_station(train_id, station_id)
+
+        targets = self._segment_targets(station_id, count)
+        stop = stop_id or self.ids.labeled("stop")
+        try:
+            session = self.align.begin(
+                train_id, stop, station_id, targets, self.clock.now()
+            )
+        except RailError as error:
+            self.audit.record(
+                "alignment_begin_rejected",
+                train_id,
+                station_id,
+                reason=error.message,
+            )
+            return {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "violations": [error.message],
+            }
+        entry = self.audit.record(
+            "alignment_begin",
+            train_id,
+            station_id,
+            stop_id=stop,
+            segments=count,
+            targets=targets,
+        )
+        self._persist()
+        return {
+            "ok": True,
+            "train_id": train_id,
+            "station_id": station_id,
+            "stop_id": stop,
+            "state": session.state,
+            "attempt": session.attempt,
+            "targets": targets,
+            "segment_count": count,
+            "confirmed_segments": session.confirmed_indices(),
+            "pending_segments": session.pending_indices(),
+            "violations": [],
+            "audit_id": entry.id,
+        }
+
+    def report_alignment(
+        self,
+        train_id: str,
+        index: int,
+        position_m: float,
+        request_id: str = "",
+        attempt: int | None = None,
+    ) -> dict:
+        """上报一段停稳位置；全部段落盘后可开门，任一段超差整车挂起。"""
+
+        try:
+            before = self.align.require_session(train_id)
+        except RailError as error:
+            return {"ok": False, "train_id": train_id, "violations": [error.message]}
+        station_id = before.station_id
+        try:
+            session = self.align.report(
+                train_id, index, position_m, self.clock.now(),
+                request_id=request_id, attempt=attempt,
+            )
+        except AlignmentError as error:
+            session = getattr(error, "session", None) or self.align.get_session(train_id)
+            self.audit.record(
+                "alignment_segment_held",
+                train_id,
+                station_id,
+                stop_id=before.stop_id,
+                attempt=before.attempt,
+                segment=index,
+                position_m=position_m,
+                reason=error.message,
+            )
+            self.bus.publish(
+                Event.of(
+                    "audit",
+                    "train",
+                    "alignment_held",
+                    train_id=train_id,
+                    station_id=station_id,
+                    severity="alarm",
+                    message=error.message,
+                    segment=index,
+                )
+            )
+            self._persist()
+            return {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "stop_id": before.stop_id,
+                "state": HELD,
+                "attempt": before.attempt,
+                "held_segments": session.held_indices() if session else [index],
+                "violations": [error.message],
+            }
+        entry = self.audit.record(
+            "alignment_segment_confirmed",
+            train_id,
+            station_id,
+            stop_id=session.stop_id,
+            attempt=session.attempt,
+            segment=index,
+            position_m=position_m,
+            request_id=request_id,
+        )
+        self._persist()
+        return {
+            "ok": True,
+            "train_id": train_id,
+            "station_id": station_id,
+            "stop_id": session.stop_id,
+            "state": session.state,
+            "attempt": session.attempt,
+            "confirmed_segments": session.confirmed_indices(),
+            "held_segments": session.held_indices(),
+            "pending_segments": session.pending_indices(),
+            "violations": [],
+            "audit_id": entry.id,
+        }
+
+    def realign_alignment(
+        self,
+        train_id: str,
+        anchor_position_m: float,
+        request_id: str = "",
+    ) -> dict:
+        """挂起后重新对位：锚点平移复核已确认段，从已确认段接着收报。"""
+
+        before = self.align.get_session(train_id)
+        if before is None:
+            return {"ok": False, "train_id": train_id, "violations": ["列车没有分段对位会话"]}
+        station_id = before.station_id
+        try:
+            session = self.align.realign(
+                train_id, anchor_position_m, self.clock.now(), request_id=request_id
+            )
+        except RailError as error:
+            return {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "violations": [error.message],
+            }
+        entry = self.audit.record(
+            "alignment_realign",
+            train_id,
+            station_id,
+            stop_id=session.stop_id,
+            attempt=session.attempt,
+            anchor_position_m=anchor_position_m,
+            carried=session.confirmed_indices(),
+            pending_segments=session.pending_indices(),
+            held=session.state == HELD,
+        )
+        self.bus.publish(
+            Event.of(
+                "door" if session.state != HELD else "audit",
+                "train",
+                "alignment_realigned" if session.state != HELD else "alignment_held",
+                train_id=train_id,
+                station_id=station_id,
+                severity="notice" if session.state != HELD else "alarm",
+                attempt=session.attempt,
+            )
+        )
+        self._persist()
+        return {
+            "ok": session.state != HELD,
+            "train_id": train_id,
+            "station_id": station_id,
+            "stop_id": session.stop_id,
+            "state": session.state,
+            "attempt": session.attempt,
+            "confirmed_segments": session.confirmed_indices(),
+            "held_segments": session.held_indices(),
+            "pending_segments": session.pending_indices(),
+            "violations": [] if session.state != HELD else ["锚点段重新对位后仍超差"],
+            "audit_id": entry.id,
+        }
+
+    def open_aligned_doors(self, train_id: str, station_id: str = "") -> dict:
+        """分段对位全部落盘后开门；未全部确认或挂起时拒绝。"""
+
+        session = self.align.get_session(train_id)
+        if session is None:
+            return {"ok": False, "train_id": train_id, "violations": ["列车没有分段对位会话"]}
+        target_station = station_id or session.station_id
+        if session.state == HELD:
+            return {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": target_station,
+                "state": HELD,
+                "violations": ["分段对位挂起，禁止开门，需重新对位"],
+            }
+        try:
+            opened_report = self.doors_open(train_id, target_station)
+        except RailError as error:
+            return {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": target_station,
+                "state": session.state,
+                "pending_segments": session.pending_indices(),
+                "violations": [error.message],
+            }
+        entry = self.audit.record(
+            "alignment_open",
+            train_id,
+            target_station,
+            stop_id=session.stop_id,
+            attempt=session.attempt,
+            segments=session.segment_count,
+        )
+        return {
+            "ok": True,
+            "train_id": train_id,
+            "station_id": target_station,
+            "stop_id": session.stop_id,
+            "state": CONFIRMED,
+            "segment_count": session.segment_count,
+            "group": opened_report["group"],
+            "violations": [],
+            "audit_id": entry.id,
+        }
+
     def depart(self, train_id: str, station_id: str) -> dict:
         """关门到发车：关门指令 → 间隙探测 → 关门落盘 → 发车信号。"""
 
@@ -507,6 +775,10 @@ class Platform:
         departure = depart(self.doors, train_id, self.clock.now())
         if gate is not None:
             self.lockouts.clear(gate.id)
+        self.align.clear(train_id)
+        steps.append(
+            {"component": "train", "action": "align_clear", "detail": {"train_id": train_id}}
+        )
         report = {
             "ok": True,
             "train_id": train_id,
@@ -525,8 +797,19 @@ class Platform:
     def check_gap(self, train_id: str, clear: bool = True) -> dict:
         """确认间隙无异常，或登记一次可疑探测结果。"""
 
+        if clear and not self.align.durable(train_id):
+            if self.align.held(train_id):
+                reason = "列车分段对位挂起，无法确认间隙"
+            elif self.align.get_session(train_id) is not None:
+                reason = "分段对位尚未全部落盘，无法确认间隙"
+            else:
+                reason = "列车尚未对位，无法确认间隙"
+            self.audit.record("gap_rejected", train_id, "", reason=reason)
+            return {"ok": False, "train_id": train_id, "clear": False, "violations": [reason]}
         if clear:
-            result = self.gaps.check(train_id, self.clock.now())
+            result = self.gaps.check(
+                train_id, self.clock.now(), aligned=self.align.durable(train_id)
+            )
         else:
             result = self.gaps.probe(train_id, False, self.clock.now())
         self.audit.record("gap_probe", train_id, "", clear=clear)
@@ -678,6 +961,9 @@ class Platform:
         stale = [
             train.id for train in self.trains.list() if self.positions.stale(train.id, moment)
         ]
+        held_alignments = [
+            train.id for train in self.trains.list() if self.align.held(train.id)
+        ]
         interlock = interlock_status(self.faults, self.gates, self.config.interlock.max_locked_ratio)
         holding = [
             train.id
@@ -693,6 +979,7 @@ class Platform:
             "cycle": self._cycles,
             "dt": dt,
             "stale_positions": stale,
+            "held_alignments": held_alignments,
             "locked_count": interlock["locked_count"],
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
@@ -732,6 +1019,9 @@ class Platform:
             "console_hits": len(self.bus.history("console")),
             "stations": [station.as_dict() for station in self.stations.list()],
             "trains": {train.id: train_state(train.id, self.align, self.train_doors, self.positions) for train in trains},
+            "held_alignments": [
+                train.id for train in trains if self.align.held(train.id)
+            ],
             "doors": [
                 {**gate.as_dict(), "open": gate.open, "locked": gate.locked}
                 for gate in self.gates.list()
@@ -850,6 +1140,29 @@ class Platform:
         zones = list(layout.zones) if layout else []
         nearest = nearest_zone(zones)
         return nearest.distance_m if nearest else 0
+
+    def _segment_targets(self, station_id: str, count: int) -> list[int]:
+        """按门区里程均匀取 ``count`` 个段目标，覆盖整列车首到尾。
+
+        只有一段时沿用旧语义（最近门区）；多段时在首尾门区里程间均匀取点，
+        保证车头段与车尾段各有目标，避免"车头到了车尾未必到"。
+        """
+
+        layout = self.layouts.get(station_id)
+        zones = list(layout.zones) if layout else []
+        distances = sorted(zone.distance_m for zone in zones)
+        if not distances:
+            return [0] * count
+        if count <= 1 or len(distances) == 1:
+            nearest = nearest_zone(zones)
+            return [nearest.distance_m if nearest else distances[0]] * count
+        if count >= len(distances):
+            return distances[:count] if count == len(distances) else distances
+        first, last = distances[0], distances[-1]
+        return [
+            int(round(first + (last - first) * index / (count - 1)))
+            for index in range(count)
+        ]
 
     def _primary_group(self, station_id: str) -> str:
         """返回站台的首个门区。"""

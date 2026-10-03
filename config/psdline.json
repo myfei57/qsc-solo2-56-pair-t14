@@ -18,7 +18,8 @@
     "length_m": 118.0,
     "max_position_m": 240.0,
     "dwell_default_s": 45.0,
-    "dwell_max_s": 600.0
+    "dwell_max_s": 600.0,
+    "alignment_segments": 4
   },
   "door": {
     "batch_limit": 64,

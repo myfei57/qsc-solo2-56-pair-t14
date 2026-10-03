@@ -75,6 +75,10 @@ class Api:
         add("GET", "/api/resolve", self._resolve)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/arrive", self._arrive)
+        add("POST", "/api/alignment/begin", self._alignment_begin)
+        add("POST", "/api/alignment/report", self._alignment_report)
+        add("POST", "/api/alignment/realign", self._alignment_realign)
+        add("POST", "/api/alignment/open", self._alignment_open)
         add("POST", "/api/depart", self._depart)
         add("POST", "/api/gap", self._gap)
         add("POST", "/api/enqueue", self._enqueue)
@@ -192,6 +196,38 @@ class Api:
             _require(body, "train_id"),
             _require(body, "station_id"),
             _as_int(body, "position_m", 0),
+        )
+
+    def _alignment_begin(self, params: dict, body: dict) -> dict:
+        segment_count = body.get("segments")
+        stop_id = body.get("stop_id")
+        return self._platform.begin_alignment(
+            _require(body, "train_id"),
+            _require(body, "station_id"),
+            int(segment_count) if segment_count is not None else None,
+            str(stop_id) if stop_id else None,
+        )
+
+    def _alignment_report(self, params: dict, body: dict) -> dict:
+        attempt = body.get("attempt")
+        return self._platform.report_alignment(
+            _require(body, "train_id"),
+            _as_int(body, "segment", 0),
+            _as_float(body, "position_m", 0.0),
+            str(body.get("request_id", "")),
+            int(attempt) if attempt is not None else None,
+        )
+
+    def _alignment_realign(self, params: dict, body: dict) -> dict:
+        return self._platform.realign_alignment(
+            _require(body, "train_id"),
+            _as_float(body, "anchor_position_m", 0.0),
+            str(body.get("request_id", "")),
+        )
+
+    def _alignment_open(self, params: dict, body: dict) -> dict:
+        return self._platform.open_aligned_doors(
+            _require(body, "train_id"), str(body.get("station_id", ""))
         )
 
     def _depart(self, params: dict, body: dict) -> dict:

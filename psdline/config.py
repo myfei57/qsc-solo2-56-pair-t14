@@ -49,6 +49,8 @@ class TrainSection:
     max_position_m: int = 240
     dwell_default_s: float = 45.0
     dwell_max_s: float = 600.0
+    # 停稳对位分段数：1 为旧的整车单位置模式；>=2 时到站自动按段开会话。
+    alignment_segments: int = 1
 
 
 @dataclass(frozen=True)
@@ -155,6 +157,8 @@ class PlatformConfig:
             raise ConfigError("列车位置上限必须为正", component="config")
         if self.train.dwell_max_s <= 0:
             raise ConfigError("停站时长上限必须为正", component="config")
+        if self.train.alignment_segments < 1:
+            raise ConfigError("对位分段数至少为 1", component="config")
         if self.door.batch_limit <= 0:
             raise ConfigError("批量开门上限必须为正", component="config")
         if self.gap.min_clearance_mm < 0:
